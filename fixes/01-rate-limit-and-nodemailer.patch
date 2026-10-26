@@ -1,0 +1,93 @@
+diff --git a/netlify/functions/api.mjs b/netlify/functions/api.mjs
+index b06c2e6..1e01260 100644
+--- a/netlify/functions/api.mjs
++++ b/netlify/functions/api.mjs
+@@ -31,21 +31,25 @@ function clientIp(req, context) {
+ }
+ 
+ // ---------- rate limiting ----------
+-async function checkLimit(store, scope, id, limit) {
++// Counts every ATTEMPT (not just failures) within a fixed window, so a valid login can no
++// longer reset an attacker's budget. The count is incremented up front; the limit is then
++// checked against the freshly-written value, which fails closed if two requests race
++// (Netlify Blobs has no atomic increment, so this is best-effort — see SECURITY-AUDIT.md).
++async function recordAttempt(store, scope, id, windowMs) {
+   const key = keys.rateLimit(scope, id);
+   const rec = await store.getJSON(key);
+-  if (rec && rec.resetAt > Date.now() && rec.count >= limit) {
++  const fresh = !rec || rec.resetAt <= Date.now();
++  const next = fresh ? { count: 1, resetAt: Date.now() + windowMs } : { count: rec.count + 1, resetAt: rec.resetAt };
++  await store.setJSON(key, next);
++  return next;
++}
++async function enforceLimit(store, scope, id, limit, windowMs) {
++  const rec = await recordAttempt(store, scope, id, windowMs);
++  if (rec.count > limit) {
+     const mins = Math.ceil((rec.resetAt - Date.now()) / 60000);
+     throw new HttpError(429, `Too many attempts. Please wait ${mins} minute${mins === 1 ? '' : 's'} and try again.`);
+   }
+ }
+-async function recordFailure(store, scope, id, windowMs) {
+-  const key = keys.rateLimit(scope, id);
+-  const rec = await store.getJSON(key);
+-  const fresh = !rec || rec.resetAt <= Date.now();
+-  await store.setJSON(key, fresh ? { count: 1, resetAt: Date.now() + windowMs } : { count: rec.count + 1, resetAt: rec.resetAt });
+-}
+-async function clearLimit(store, scope, id) { await store.delete(keys.rateLimit(scope, id)); }
+ 
+ // ---------- helpers ----------
+ async function loadCompany(store, slug) {
+@@ -90,19 +94,23 @@ async function verifyEmployee(req, context, store, cfg) {
+ 
+   const company = await loadCompany(store, slug);
+   if (!company || !company.active) throw new HttpError(404, 'This enrollment link is not active. Please contact AWA Insurance.');
++  // Throttle BEFORE doing the match, keyed on both the source IP and the identity being
++  // probed. Counting every attempt (not just failures) means a user's own valid login can
++  // no longer reset the budget, and the per-identity key throttles a distributed attacker
++  // guessing one employee's SSN from many IPs.
+   const ipKey = hashForKey(cfg.appSecret, `${slug}|${clientIp(req, context)}`);
+-  await checkLimit(store, 'verify', ipKey, 8);
++  const idKey = hashForKey(cfg.appSecret, `${slug}|${last4}|${dob}`);
++  await enforceLimit(store, 'verify', ipKey, 8, 15 * 60_000);
++  await enforceLimit(store, 'verify-id', idKey, 8, 60 * 60_000);
+ 
+   const roster = await store.getSecretJSON(keys.roster(slug));
+   if (!roster?.employees?.length) throw new HttpError(503, 'Enrollment is not open yet. Please contact AWA Insurance.');
+ 
+   const matches = roster.employees.filter((e) => e.dob === dob && e.ssn.slice(-4) === last4);
+   if (!matches.length) {
+-    await recordFailure(store, 'verify', ipKey, 15 * 60_000);
+     throw new HttpError(401, "We couldn't find a match for that information. Check your entries and try again, or contact AWA Insurance.");
+   }
+   if (matches.length > 1) throw new HttpError(409, 'We need to verify your identity another way. Please contact AWA Insurance to complete your form.');
+-  await clearLimit(store, 'verify', ipKey);
+   const emp = matches[0];
+ 
+   const existing = await store.getSecretJSON(keys.submission(slug, emp.id));
+@@ -185,12 +193,10 @@ async function submitAgreement(req, context, store, cfg) {
+ async function adminLogin(req, context, store, cfg) {
+   const body = await readJson(req, 5_000);
+   const ipKey = hashForKey(cfg.appSecret, clientIp(req, context));
+-  await checkLimit(store, 'admin', ipKey, 10);
++  await enforceLimit(store, 'admin', ipKey, 10, 15 * 60_000);
+   if (!safeEqualString(String(body.password || ''), cfg.adminPassword)) {
+-    await recordFailure(store, 'admin', ipKey, 15 * 60_000);
+     throw new HttpError(401, 'Incorrect password.');
+   }
+-  await clearLimit(store, 'admin', ipKey);
+   const expiresAt = Date.now() + cfg.adminSessionHours * 3_600_000;
+   return json(200, { token: signToken(cfg.appSecret, { t: 'adm', exp: expiresAt }), expiresAt });
+ }
+diff --git a/package.json b/package.json
+index 70dc0e4..f844386 100644
+--- a/package.json
++++ b/package.json
+@@ -14,7 +14,7 @@
+   "dependencies": {
+     "@netlify/blobs": "^8.1.0",
+     "jszip": "^3.10.1",
+-    "nodemailer": "^6.9.16",
++    "nodemailer": "^10.1.4",
+     "pdf-lib": "^1.17.1"
+   }
+ }
